@@ -14,7 +14,8 @@ Forecasts Roblox's Top Trending top 10 for the next 24 hours as calibrated per-p
 - Spread: place k gets weight `exp(-|y(k) - y(game)| / (s0 + s1 * sqrt(h)))`, normalised over the games, mixed with a flat share `eps`, with `nu` left unnamed for games not on the chart yet.
 - One forecast covers all 24 hours, so the hourly forecasts are averaged.
 - The eight parameters are chosen by coordinate descent on a grid, scoring every recent read as an origin against the reads that followed it, with the contest's own log score. It is deterministic, and falls back to a persistence forecast if anything fails.
-- On a walk-forward test over the archive's reads from 2026-11-05 to 2026-11-09 (fit on the reads up to each origin, scored on the next 24 hours), it averaged about -20.9 against the persistence baseline's -28.1.
+- The fitted forecast is blended 60/40 with a fixed, moderate parameter set, a hedge against a fit that a short history misleads.
+- On a walk-forward test over the archive's reads from 2026-11-05 to 2026-11-09 (fit on the reads up to each origin, scored on the next 24 hours), it averaged about -20.8 against the persistence baseline's -28.1.
 
 ## Run it
 
