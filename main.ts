@@ -8,13 +8,14 @@
 //   - position in a warped rank space, y = (10 + c) * ln(r + c): c small makes the top places tight and the lower places
 //     loose, c large is close to plain ranks;
 //   - drift: its velocity in that space over the last W hours (from the read nearest W hours back), shrunk by alpha and
-//     projected h hours ahead, capped, never above #1;
+//     projected h hours ahead, capped, never above #1; a second component (weight mix) projects the full velocity, so
+//     the games climbing fast from far down keep a real chance at the top places;
 //   - at an offset of h hours, place k gets weight exp(-|y(k) - y_g(h)| / s(h)) with s(h) = s0 + s1 * sqrt(h), normalised
 //     over the games at that place, mixed with eps of a flat share over the chart, and (1 - nu) of the place in all: nu is
 //     left unnamed for games that are not on the last chart yet;
 //   - one forecast serves every slot of the window, so the per-hour forecasts are averaged over the window's offsets
 //     (the log score's best single forecast for a mixture of hours).
-// The parameters (c, s0, s1, eps, nu, alpha, W) are fitted by the program itself on the history: it backtests every
+// The parameters (c, s0, s1, eps, nu, alpha, W, mix) are fitted by the program itself on the history: it backtests every
 // recent read as an origin, forecasts the reads that followed it within the same horizon, scores them with the contest's
 // own log score, and picks the grid values by coordinate descent. Ties keep the earlier value, so two runs agree byte for
 // byte. Any failure falls back to a persistence forecast like the house baseline's, so a forecast is always written.
@@ -32,8 +33,6 @@ const TOP = 10;
 const MAX_ROWS = 100;
 /** The most recent origins the backtest scores. */
 const MAX_ORIGINS = 72;
-/** Origins this many hours older than the last read weigh 1/e as much. */
-const ORIGIN_DECAY_H = 72;
 
 interface Read {
   t: number;
@@ -49,6 +48,7 @@ interface Params {
   nu: number;
   alpha: number;
   w: number;
+  mix: number;
 }
 
 interface Row {
@@ -57,17 +57,20 @@ interface Row {
   p: number;
 }
 
+// No c below 2 and no eps below 0.01: on a short, sticky history those win the backtest by being overconfident, and a
+// chart that then moves (the practice window: #1 left and every game moved up) punishes them hard.
 const GRID: { [K in keyof Params]: number[] } = {
-  c: [0.5, 2, 5, 10, 30, 100],
+  c: [2, 5, 10, 30, 100],
   s0: [0.2, 0.35, 0.5, 0.8, 1.2, 1.8, 2.5, 3.5],
   s1: [0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1.2],
-  eps: [0, 0.01, 0.03, 0.06, 0.1, 0.15, 0.25],
+  eps: [0.01, 0.03, 0.06, 0.1, 0.15, 0.25],
   nu: [0.005, 0.01, 0.02, 0.04, 0.08, 0.12],
   alpha: [0, 0.15, 0.3, 0.5, 0.75, 1],
   w: [6, 12, 24, 48],
+  mix: [0, 0.05, 0.1, 0.2, 0.35, 0.5],
 };
 
-const DEFAULTS: Params = { c: 5, s0: 0.8, s1: 0.2, eps: 0.03, nu: 0.02, alpha: 0.3, w: 12 };
+const DEFAULTS: Params = { c: 5, s0: 0.8, s1: 0.2, eps: 0.03, nu: 0.02, alpha: 0.3, w: 12, mix: 0 };
 
 function loadReads(text: string): Read[] {
   const reads: Read[] = [];
@@ -156,30 +159,37 @@ function forecast(reads: Read[], o: number, back: number, offsets: number[], p: 
   const y = new Float64Array(n);
   const d = new Float64Array(n);
   const flat = p.eps / n;
-  for (const h of offsets) {
-    const s = p.s0 + p.s1 * Math.sqrt(h);
-    for (let g = 0; g < n; g++) {
-      let shift = p.alpha * v[g]! * h;
-      if (shift > maxShift) shift = maxShift;
-      else if (shift < -maxShift) shift = -maxShift;
-      const yg = y0[g]! + shift;
-      y[g] = yg < top ? top : yg;
-    }
-    for (let k = 0; k < places; k++) {
-      let dmin = Infinity;
+  // Two components: the drift shrunk by alpha (weight 1 - mix), and the full drift (weight mix), which gives the games
+  // climbing fast a heavy tail toward the top without moving every game.
+  for (let comp = 0; comp < 2; comp++) {
+    const cw = comp === 0 ? 1 - p.mix : p.mix;
+    const ca = comp === 0 ? p.alpha : 1;
+    if (cw <= 0) continue;
+    for (const h of offsets) {
+      const s = p.s0 + p.s1 * Math.sqrt(h);
       for (let g = 0; g < n; g++) {
-        const dist = Math.abs(fk[k]! - y[g]!);
-        d[g] = dist;
-        if (dist < dmin) dmin = dist;
+        let shift = ca * v[g]! * h;
+        if (shift > maxShift) shift = maxShift;
+        else if (shift < -maxShift) shift = -maxShift;
+        const yg = y0[g]! + shift;
+        y[g] = yg < top ? top : yg;
       }
-      let sum = 0;
-      for (let g = 0; g < n; g++) {
-        const e = Math.exp(-(d[g]! - dmin) / s);
-        d[g] = e;
-        sum += e;
+      for (let k = 0; k < places; k++) {
+        let dmin = Infinity;
+        for (let g = 0; g < n; g++) {
+          const dist = Math.abs(fk[k]! - y[g]!) / s;
+          d[g] = dist;
+          if (dist < dmin) dmin = dist;
+        }
+        let sum = 0;
+        for (let g = 0; g < n; g++) {
+          const e = Math.exp(-(d[g]! - dmin));
+          d[g] = e;
+          sum += e;
+        }
+        const row = P[k]!;
+        for (let g = 0; g < n; g++) row[g] = row[g]! + cw * ((1 - p.eps) * (d[g]! / sum) + flat);
       }
-      const row = P[k]!;
-      for (let g = 0; g < n; g++) row[g] = row[g]! + (1 - p.eps) * (d[g]! / sum) + flat;
     }
   }
   const scale = (1 - p.nu) / offsets.length;
@@ -242,8 +252,9 @@ function fit(reads: Read[], offsets: number[], places: number): Params {
     const back = new Map<number, number>();
     for (const w of GRID.w) back.set(w, lookback(reads, o, w));
     // A recent origin whose horizon runs past the last read is scored on its early hours only: it weighs that much less.
+    // Older origins weigh the same as newer ones (a walk-forward test over 2026-11-05..09 scored best without decay).
     const coverage = Math.min(1, (last.t - t) / HOUR / hi);
-    origins.push({ o, weight: coverage * Math.exp(-(last.t - t) / HOUR / ORIGIN_DECAY_H), evals, back });
+    origins.push({ o, weight: coverage, evals, back });
   }
   if (origins.length < 3) return { ...DEFAULTS };
   let best: Params = { ...DEFAULTS };
